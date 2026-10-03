@@ -1,0 +1,11 @@
+bin/
+build/
+.go-cache/
+.gomodcache/
+.go-tmp/
+data/
+*.log
+*.db
+*.db-*
+.env
+.env.*
