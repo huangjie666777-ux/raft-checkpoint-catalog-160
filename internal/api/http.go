@@ -32,6 +32,10 @@ func NewServer(n *node.Node, httpAddr string) *Server {
 	s.mux.HandleFunc("POST /renew", s.handleRenew)
 	s.mux.HandleFunc("POST /release", s.handleRelease)
 	s.mux.HandleFunc("GET /query", s.handleQuery)
+	s.mux.HandleFunc("POST /barrier/create", s.handleBarrierCreate)
+	s.mux.HandleFunc("POST /barrier/arrive", s.handleBarrierArrive)
+	s.mux.HandleFunc("POST /barrier/advance", s.handleBarrierAdvance)
+	s.mux.HandleFunc("GET /barrier", s.handleBarrierQuery)
 	s.srv = &http.Server{Addr: httpAddr, Handler: s.mux}
 	return s
 }
@@ -60,6 +64,8 @@ type lockResponse struct {
 	Expiry int64  `json:"expiry,omitempty"`
 	Leader string `json:"leader,omitempty"`
 	Error  string `json:"error,omitempty"`
+
+	Barrier *fsm.BarrierView `json:"barrier,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -98,11 +104,13 @@ func (s *Server) propose(w http.ResponseWriter, cmd fsm.Command) {
 	if !res.OK {
 		writeJSON(w, http.StatusConflict, lockResponse{
 			OK: false, Holder: res.Holder, Token: res.Token, Expiry: res.Expiry, Error: res.Err,
+			Barrier: res.Barrier,
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, lockResponse{
 		OK: true, Holder: res.Holder, Token: res.Token, Expiry: res.Expiry,
+		Barrier: res.Barrier,
 	})
 }
 
@@ -184,12 +192,96 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "resource is required"})
 		return
 	}
-	// Expired leases are reported as empty.
-	if l := s.node.FSM.Query(resource, time.Now()); l != nil {
-		writeJSON(w, http.StatusOK, lockResponse{
-			OK: true, Holder: l.Holder, Token: l.Token, Expiry: l.Expiry.Unix(),
-		})
+	// Reads are decided from the committed log like writes: the query is
+	// itself replicated, so followers never answer from local state and
+	// the decision time travels with the command.
+	s.propose(w, fsm.Command{Type: fsm.CmdQueryLease, Resource: resource, Now: time.Now()})
+}
+
+type barrierCreateRequest struct {
+	Name         string   `json:"name"`
+	Participants []string `json:"participants"`
+}
+
+type barrierArriveRequest struct {
+	Name        string `json:"name"`
+	Round       uint64 `json:"round"`
+	Participant string `json:"participant"`
+	Resource    string `json:"resource"`
+	Holder      string `json:"holder"`
+	Token       uint64 `json:"token"`
+}
+
+type barrierAdvanceRequest struct {
+	Name  string `json:"name"`
+	Round uint64 `json:"round"`
+}
+
+func (s *Server) handleBarrierCreate(w http.ResponseWriter, r *http.Request) {
+	if !s.requireLeader(w) {
 		return
 	}
-	writeJSON(w, http.StatusOK, lockResponse{OK: false})
+	var req barrierCreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "invalid JSON: " + err.Error()})
+		return
+	}
+	if req.Name == "" {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "name is required"})
+		return
+	}
+	s.propose(w, fsm.Command{
+		Type: fsm.CmdBarrierCreate, Barrier: req.Name,
+		Participants: req.Participants, Now: time.Now(),
+	})
+}
+
+func (s *Server) handleBarrierArrive(w http.ResponseWriter, r *http.Request) {
+	if !s.requireLeader(w) {
+		return
+	}
+	var req barrierArriveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "invalid JSON: " + err.Error()})
+		return
+	}
+	if req.Name == "" || req.Participant == "" || req.Resource == "" || req.Holder == "" {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "name, participant, resource and holder are required"})
+		return
+	}
+	s.propose(w, fsm.Command{
+		Type: fsm.CmdBarrierArrive, Barrier: req.Name, Round: req.Round,
+		Participant: req.Participant, Resource: req.Resource,
+		Holder: req.Holder, Token: req.Token, Now: time.Now(),
+	})
+}
+
+func (s *Server) handleBarrierAdvance(w http.ResponseWriter, r *http.Request) {
+	if !s.requireLeader(w) {
+		return
+	}
+	var req barrierAdvanceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "invalid JSON: " + err.Error()})
+		return
+	}
+	if req.Name == "" {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "name is required"})
+		return
+	}
+	s.propose(w, fsm.Command{
+		Type: fsm.CmdBarrierAdvance, Barrier: req.Name, Round: req.Round, Now: time.Now(),
+	})
+}
+
+func (s *Server) handleBarrierQuery(w http.ResponseWriter, r *http.Request) {
+	if !s.requireLeader(w) {
+		return
+	}
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "name is required"})
+		return
+	}
+	s.propose(w, fsm.Command{Type: fsm.CmdBarrierQuery, Barrier: name, Now: time.Now()})
 }
