@@ -4,6 +4,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -36,6 +37,10 @@ func NewServer(n *node.Node, httpAddr string) *Server {
 	s.mux.HandleFunc("POST /barrier/arrive", s.handleBarrierArrive)
 	s.mux.HandleFunc("POST /barrier/advance", s.handleBarrierAdvance)
 	s.mux.HandleFunc("GET /barrier", s.handleBarrierQuery)
+	s.mux.HandleFunc("POST /checkpoint/create", s.handleCheckpointCreate)
+	s.mux.HandleFunc("POST /checkpoint/submit", s.handleCheckpointSubmit)
+	s.mux.HandleFunc("POST /checkpoint/publish", s.handleCheckpointPublish)
+	s.mux.HandleFunc("GET /checkpoint", s.handleCheckpointQuery)
 	s.srv = &http.Server{Addr: httpAddr, Handler: s.mux}
 	return s
 }
@@ -66,6 +71,8 @@ type lockResponse struct {
 	Error  string `json:"error,omitempty"`
 
 	Barrier *fsm.BarrierView `json:"barrier,omitempty"`
+
+	Checkpoint *fsm.CheckpointView `json:"checkpoint,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
@@ -104,13 +111,13 @@ func (s *Server) propose(w http.ResponseWriter, cmd fsm.Command) {
 	if !res.OK {
 		writeJSON(w, http.StatusConflict, lockResponse{
 			OK: false, Holder: res.Holder, Token: res.Token, Expiry: res.Expiry, Error: res.Err,
-			Barrier: res.Barrier,
+			Barrier: res.Barrier, Checkpoint: res.Checkpoint,
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, lockResponse{
 		OK: true, Holder: res.Holder, Token: res.Token, Expiry: res.Expiry,
-		Barrier: res.Barrier,
+		Barrier: res.Barrier, Checkpoint: res.Checkpoint,
 	})
 }
 
@@ -284,4 +291,123 @@ func (s *Server) handleBarrierQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.propose(w, fsm.Command{Type: fsm.CmdBarrierQuery, Barrier: name, Now: time.Now()})
+}
+
+type checkpointCreateRequest struct {
+	Task       string `json:"task"`
+	Generation uint64 `json:"generation"`
+	Barrier    string `json:"barrier"`
+}
+
+type checkpointSubmitRequest struct {
+	Task        string `json:"task"`
+	Generation  uint64 `json:"generation"`
+	Participant string `json:"participant"`
+	Resource    string `json:"resource"`
+	Holder      string `json:"holder"`
+	Token       uint64 `json:"token"`
+	URI         string `json:"uri"`
+	SHA256      string `json:"sha256"`
+	Bytes       uint64 `json:"bytes"`
+}
+
+type checkpointPublishRequest struct {
+	Task       string `json:"task"`
+	Generation uint64 `json:"generation"`
+}
+
+func validTaskGeneration(w http.ResponseWriter, task string, gen uint64) bool {
+	if task == "" || gen < 1 {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "task and a positive integer generation are required"})
+		return false
+	}
+	return true
+}
+
+func (s *Server) handleCheckpointCreate(w http.ResponseWriter, r *http.Request) {
+	if !s.requireLeader(w) {
+		return
+	}
+	var req checkpointCreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "invalid JSON: " + err.Error()})
+		return
+	}
+	if !validTaskGeneration(w, req.Task, req.Generation) {
+		return
+	}
+	if req.Barrier == "" {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "barrier is required"})
+		return
+	}
+	s.propose(w, fsm.Command{
+		Type: fsm.CmdCheckpointCreate, Task: req.Task, Generation: req.Generation,
+		Barrier: req.Barrier, Now: time.Now(),
+	})
+}
+
+func (s *Server) handleCheckpointSubmit(w http.ResponseWriter, r *http.Request) {
+	if !s.requireLeader(w) {
+		return
+	}
+	var req checkpointSubmitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "invalid JSON: " + err.Error()})
+		return
+	}
+	if !validTaskGeneration(w, req.Task, req.Generation) {
+		return
+	}
+	if req.Participant == "" || req.Resource == "" || req.Holder == "" {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "participant, resource and holder are required"})
+		return
+	}
+	if req.URI == "" {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "uri is required"})
+		return
+	}
+	s.propose(w, fsm.Command{
+		Type: fsm.CmdCheckpointSubmit, Task: req.Task, Generation: req.Generation,
+		Participant: req.Participant, Resource: req.Resource,
+		Holder: req.Holder, Token: req.Token,
+		URI: req.URI, SHA256: req.SHA256, Bytes: req.Bytes, Now: time.Now(),
+	})
+}
+
+func (s *Server) handleCheckpointPublish(w http.ResponseWriter, r *http.Request) {
+	if !s.requireLeader(w) {
+		return
+	}
+	var req checkpointPublishRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "invalid JSON: " + err.Error()})
+		return
+	}
+	if !validTaskGeneration(w, req.Task, req.Generation) {
+		return
+	}
+	s.propose(w, fsm.Command{
+		Type: fsm.CmdCheckpointPublish, Task: req.Task, Generation: req.Generation, Now: time.Now(),
+	})
+}
+
+func (s *Server) handleCheckpointQuery(w http.ResponseWriter, r *http.Request) {
+	if !s.requireLeader(w) {
+		return
+	}
+	task := r.URL.Query().Get("task")
+	if task == "" {
+		writeJSON(w, http.StatusBadRequest, lockResponse{Error: "task is required"})
+		return
+	}
+	var gen uint64
+	if raw := r.URL.Query().Get("generation"); raw != "" {
+		if _, err := fmt.Sscanf(raw, "%d", &gen); err != nil || gen < 1 {
+			writeJSON(w, http.StatusBadRequest, lockResponse{Error: "generation must be a positive integer"})
+			return
+		}
+	}
+	// Like every read, the query is replicated and decided from the
+	// committed log; followers never answer from local state.
+	s.propose(w, fsm.Command{Type: fsm.CmdCheckpointQuery, Task: task, Generation: gen, Now: time.Now()})
 }

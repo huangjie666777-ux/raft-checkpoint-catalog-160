@@ -26,6 +26,11 @@ const (
 	CmdBarrierArrive  = "barrier_arrive"
 	CmdBarrierAdvance = "barrier_advance"
 	CmdBarrierQuery   = "barrier_query"
+
+	CmdCheckpointCreate  = "checkpoint_create"
+	CmdCheckpointSubmit  = "checkpoint_submit"
+	CmdCheckpointPublish = "checkpoint_publish"
+	CmdCheckpointQuery   = "checkpoint_query"
 )
 
 // Command is the unit of replication. Now is the decision time written by
@@ -43,6 +48,13 @@ type Command struct {
 	Round        uint64   `json:"round,omitempty"`
 	Participants []string `json:"participants,omitempty"`
 	Participant  string   `json:"participant,omitempty"`
+
+	// Checkpoint fields (used by checkpoint commands only).
+	Task       string `json:"task,omitempty"`
+	Generation uint64 `json:"generation,omitempty"`
+	URI        string `json:"uri,omitempty"`
+	SHA256     string `json:"sha256,omitempty"`
+	Bytes      uint64 `json:"bytes"`
 }
 
 // Barrier lifecycle states.
@@ -68,6 +80,11 @@ type Barrier struct {
 	Status       string                         `json:"status"`
 	Arrivals     map[string]BarrierRegistration `json:"arrivals"`
 	FailReason   string                         `json:"fail_reason,omitempty"`
+
+	// BoundTask/BoundGeneration name the checkpoint this round is bound
+	// to; empty when unbound. Cleared on advance.
+	BoundTask       string `json:"bound_task,omitempty"`
+	BoundGeneration uint64 `json:"bound_generation,omitempty"`
 }
 
 // BarrierView is the externally visible, copy-safe form of a Barrier.
@@ -112,6 +129,8 @@ type Result struct {
 	Err    string `json:"err,omitempty"`
 
 	Barrier *BarrierView `json:"barrier,omitempty"`
+
+	Checkpoint *CheckpointView `json:"checkpoint,omitempty"`
 }
 
 // FSM is the replicated lease-lock state machine.
@@ -124,13 +143,19 @@ type FSM struct {
 	tokenBounds map[string]uint64
 	// barriers holds named phase barriers, keyed by name.
 	barriers map[string]*Barrier
+	// checkpoints holds checkpoint descriptors, keyed by task then generation.
+	checkpoints map[string]map[uint64]*Checkpoint
+	// latestPublished is the latest published generation per task.
+	latestPublished map[string]uint64
 }
 
 func New() *FSM {
 	return &FSM{
-		leases:      make(map[string]*Lease),
-		tokenBounds: make(map[string]uint64),
-		barriers:    make(map[string]*Barrier),
+		leases:          make(map[string]*Lease),
+		tokenBounds:     make(map[string]uint64),
+		barriers:        make(map[string]*Barrier),
+		checkpoints:     make(map[string]map[uint64]*Checkpoint),
+		latestPublished: make(map[string]uint64),
 	}
 }
 
@@ -211,6 +236,15 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		}
 		return Result{OK: true, Barrier: b.view()}
 
+	case CmdCheckpointCreate:
+		return f.applyCheckpointCreate(cmd)
+	case CmdCheckpointSubmit:
+		return f.applyCheckpointSubmit(cmd)
+	case CmdCheckpointPublish:
+		return f.applyCheckpointPublish(cmd)
+	case CmdCheckpointQuery:
+		return f.applyCheckpointQuery(cmd)
+
 	default:
 		return Result{Err: fmt.Sprintf("unknown command type %q", cmd.Type)}
 	}
@@ -222,11 +256,26 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 // command, so a waiting barrier's invalidation is decided no later than
 // the next barrier operation.
 func (f *FSM) checkBarrierLiveness(now time.Time) {
-	for _, b := range f.barriers {
+	// Iterate in sorted order so every replica records the identical
+	// failure when several barriers or arrivals go invalid at once;
+	// raw map order would diverge across replicas.
+	names := make([]string, 0, len(f.barriers))
+	for name := range f.barriers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		b := f.barriers[name]
 		if b.Status != BarrierWaiting {
 			continue
 		}
-		for _, reg := range b.Arrivals {
+		parts := make([]string, 0, len(b.Arrivals))
+		for p := range b.Arrivals {
+			parts = append(parts, p)
+		}
+		sort.Strings(parts)
+		for _, p := range parts {
+			reg := b.Arrivals[p]
 			if !f.registrationLeaseValid(reg, now) {
 				b.Status = BarrierFailed
 				b.FailReason = fmt.Sprintf("lease for participant %q on resource %q is no longer valid", reg.Participant, reg.Resource)
@@ -301,6 +350,12 @@ func (f *FSM) applyBarrierArrive(cmd Command) Result {
 	if b.Status != BarrierWaiting {
 		return Result{OK: false, Err: "round already " + b.Status + ", arrivals are closed", Barrier: b.view()}
 	}
+	if b.BoundTask != "" {
+		// A checkpoint-bound round only accepts arrivals carrying shard
+		// metadata via checkpoint_submit, so publish can never be
+		// short-circuited by shard-less arrivals.
+		return Result{OK: false, Err: "round is bound to a checkpoint; use checkpoint submit", Barrier: b.view()}
+	}
 	member := false
 	for _, p := range b.Participants {
 		if p == cmd.Participant {
@@ -336,7 +391,7 @@ func (f *FSM) applyBarrierArrive(cmd Command) Result {
 	if len(b.Arrivals) == len(b.Participants) {
 		// All arrived: re-validate every registered lease in this same
 		// commit before completing.
-		for _, r := range b.Arrivals {
+		for _, r := range sortedArrivals(b) {
 			if !f.registrationLeaseValid(r, cmd.Now) {
 				b.Status = BarrierFailed
 				b.FailReason = fmt.Sprintf("lease for participant %q on resource %q invalid at completion", r.Participant, r.Resource)
@@ -366,7 +421,24 @@ func (f *FSM) applyBarrierAdvance(cmd Command) Result {
 	b.Status = BarrierWaiting
 	b.Arrivals = make(map[string]BarrierRegistration)
 	b.FailReason = ""
+	b.BoundTask = ""
+	b.BoundGeneration = 0
 	return Result{OK: true, Barrier: b.view()}
+}
+
+// sortedArrivals returns arrival registrations ordered by participant ID,
+// keeping completion checks deterministic across replicas.
+func sortedArrivals(b *Barrier) []BarrierRegistration {
+	parts := make([]string, 0, len(b.Arrivals))
+	for p := range b.Arrivals {
+		parts = append(parts, p)
+	}
+	sort.Strings(parts)
+	regs := make([]BarrierRegistration, 0, len(parts))
+	for _, p := range parts {
+		regs = append(regs, b.Arrivals[p])
+	}
+	return regs
 }
 
 // Query returns the live lease for a resource as of now, or nil.
@@ -393,16 +465,22 @@ type snapshot struct {
 	TokenBounds map[string]uint64 `json:"token_bounds"`
 	// Barriers is absent in older snapshots; Restore treats it as empty.
 	Barriers map[string]*Barrier `json:"barriers,omitempty"`
+	// Checkpoints and LatestPublished are absent in older snapshots;
+	// Restore treats them as empty.
+	Checkpoints     map[string]map[uint64]*Checkpoint `json:"checkpoints,omitempty"`
+	LatestPublished map[string]uint64                 `json:"latest_published,omitempty"`
 }
 
-// Snapshot captures leases, token upper bounds and barrier state.
+// Snapshot captures leases, token upper bounds, barrier and checkpoint state.
 func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	s := snapshot{
-		Leases:      make(map[string]*Lease, len(f.leases)),
-		TokenBounds: make(map[string]uint64, len(f.tokenBounds)),
-		Barriers:    make(map[string]*Barrier, len(f.barriers)),
+		Leases:          make(map[string]*Lease, len(f.leases)),
+		TokenBounds:     make(map[string]uint64, len(f.tokenBounds)),
+		Barriers:        make(map[string]*Barrier, len(f.barriers)),
+		Checkpoints:     make(map[string]map[uint64]*Checkpoint, len(f.checkpoints)),
+		LatestPublished: make(map[string]uint64, len(f.latestPublished)),
 	}
 	for k, v := range f.leases {
 		cp := *v
@@ -419,6 +497,16 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 			cp.Arrivals[p] = reg
 		}
 		s.Barriers[k] = &cp
+	}
+	for task, gens := range f.checkpoints {
+		cpGens := make(map[uint64]*Checkpoint, len(gens))
+		for gen, cp := range gens {
+			cpGens[gen] = cp.deepCopy()
+		}
+		s.Checkpoints[task] = cpGens
+	}
+	for task, gen := range f.latestPublished {
+		s.LatestPublished[task] = gen
 	}
 	return &fsmSnapshot{state: s}, nil
 }
@@ -449,6 +537,26 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 		if b.Arrivals == nil {
 			b.Arrivals = make(map[string]BarrierRegistration)
 		}
+	}
+	f.checkpoints = s.Checkpoints
+	if f.checkpoints == nil {
+		// Old snapshots carry no checkpoint state.
+		f.checkpoints = make(map[string]map[uint64]*Checkpoint)
+	}
+	for task, gens := range f.checkpoints {
+		if gens == nil {
+			gens = make(map[uint64]*Checkpoint)
+			f.checkpoints[task] = gens
+		}
+		for _, cp := range gens {
+			if cp.Shards == nil {
+				cp.Shards = make(map[string]ShardMeta)
+			}
+		}
+	}
+	f.latestPublished = s.LatestPublished
+	if f.latestPublished == nil {
+		f.latestPublished = make(map[string]uint64)
 	}
 	return nil
 }
