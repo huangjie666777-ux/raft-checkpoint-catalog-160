@@ -3,6 +3,7 @@ package fsm
 import (
 	"bytes"
 	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -197,5 +198,22 @@ func TestQueryLeaseCommand(t *testing.T) {
 	expired := apply(t, f, Command{Type: CmdQueryLease, Resource: "r", Now: base.Add(20 * time.Second)})
 	if expired.OK {
 		t.Fatalf("expired lease must query empty: %+v", expired)
+	}
+}
+
+func TestMultipleLeaseFailureReasonIsDeterministic(t *testing.T) {
+	for range 20 {
+		f := New()
+		createBarrier(t, f, "b", "p1", "p2", "p3")
+		apply(t, f, Command{Type: CmdAcquire, Resource: "r1", Holder: "h1", TTL: 60, Now: base})
+		apply(t, f, Command{Type: CmdAcquire, Resource: "r2", Holder: "h2", TTL: 60, Now: base})
+		arrive(t, f, "b", 1, "p1", "r1", "h1", 1, base)
+		arrive(t, f, "b", 1, "p2", "r2", "h2", 1, base)
+		apply(t, f, Command{Type: CmdRelease, Resource: "r1", Holder: "h1", Token: 1, Now: base})
+		apply(t, f, Command{Type: CmdRelease, Resource: "r2", Holder: "h2", Token: 1, Now: base})
+		q := apply(t, f, Command{Type: CmdBarrierQuery, Barrier: "b", Now: base})
+		if !q.OK || q.Barrier.Status != BarrierFailed || !strings.Contains(q.Barrier.FailReason, "p1") {
+			t.Fatalf("deterministic first failing participant: %+v", q)
+		}
 	}
 }

@@ -6,6 +6,7 @@
 package fsm
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,14 +19,19 @@ import (
 
 // Command types carried in Raft log entries.
 const (
-	CmdAcquire        = "acquire"
-	CmdRenew          = "renew"
-	CmdRelease        = "release"
-	CmdQueryLease     = "query_lease"
-	CmdBarrierCreate  = "barrier_create"
-	CmdBarrierArrive  = "barrier_arrive"
-	CmdBarrierAdvance = "barrier_advance"
-	CmdBarrierQuery   = "barrier_query"
+	CmdAcquire            = "acquire"
+	CmdRenew              = "renew"
+	CmdRelease            = "release"
+	CmdQueryLease         = "query_lease"
+	CmdBarrierCreate      = "barrier_create"
+	CmdBarrierArrive      = "barrier_arrive"
+	CmdBarrierAdvance     = "barrier_advance"
+	CmdBarrierQuery       = "barrier_query"
+	CmdCheckpointCreate   = "checkpoint_create"
+	CmdCheckpointRegister = "checkpoint_register"
+	CmdCheckpointPublish  = "checkpoint_publish"
+	CmdCheckpointQuery    = "checkpoint_query"
+	CmdCheckpointLatest   = "checkpoint_latest"
 )
 
 // Command is the unit of replication. Now is the decision time written by
@@ -43,6 +49,12 @@ type Command struct {
 	Round        uint64   `json:"round,omitempty"`
 	Participants []string `json:"participants,omitempty"`
 	Participant  string   `json:"participant,omitempty"`
+
+	Task       string `json:"task,omitempty"`
+	Generation uint64 `json:"generation,omitempty"`
+	URI        string `json:"uri,omitempty"`
+	SHA256     string `json:"sha256,omitempty"`
+	Size       uint64 `json:"size,omitempty"`
 }
 
 // Barrier lifecycle states.
@@ -96,6 +108,64 @@ func (b *Barrier) view() *BarrierView {
 	}
 }
 
+// CheckpointShard is participant-supplied shard metadata. The FSM never
+// reads URI; it stores only metadata.
+type CheckpointShard struct {
+	Participant string `json:"participant"`
+	Resource    string `json:"resource"`
+	Holder      string `json:"holder"`
+	Token       uint64 `json:"token"`
+	URI         string `json:"uri"`
+	SHA256      string `json:"sha256"`
+	Size        uint64 `json:"size"`
+}
+
+type ShardView struct {
+	Participant string `json:"participant"`
+	URI         string `json:"uri"`
+	SHA256      string `json:"sha256"`
+	Size        uint64 `json:"size"`
+}
+
+type ManifestView struct {
+	Task       string      `json:"task"`
+	Generation uint64      `json:"generation"`
+	Barrier    string      `json:"barrier"`
+	Round      uint64      `json:"round"`
+	Shards     []ShardView `json:"shards"`
+}
+
+type Checkpoint struct {
+	Task       string                     `json:"task"`
+	Generation uint64                     `json:"generation"`
+	Barrier    string                     `json:"barrier"`
+	Round      uint64                     `json:"round"`
+	Candidates map[string]CheckpointShard `json:"candidates"`
+	Published  *ManifestView              `json:"published,omitempty"`
+}
+
+type CheckpointView struct {
+	Task        string        `json:"task"`
+	Generation  uint64        `json:"generation"`
+	Barrier     string        `json:"barrier"`
+	Round       uint64        `json:"round"`
+	Published   bool          `json:"published"`
+	Manifest    *ManifestView `json:"manifest,omitempty"`
+	BarrierView *BarrierView  `json:"barrier_view,omitempty"`
+}
+
+func (c *Checkpoint) view() *CheckpointView {
+	return &CheckpointView{
+		Task:        c.Task,
+		Generation:  c.Generation,
+		Barrier:     c.Barrier,
+		Round:       c.Round,
+		Published:   c.Published != nil,
+		Manifest:    c.Published,
+		BarrierView: nil,
+	}
+}
+
 // Lease is an active lock on a resource.
 type Lease struct {
 	Holder string    `json:"holder"`
@@ -111,7 +181,9 @@ type Result struct {
 	Expiry int64  `json:"expiry,omitempty"` // unix seconds
 	Err    string `json:"err,omitempty"`
 
-	Barrier *BarrierView `json:"barrier,omitempty"`
+	Barrier    *BarrierView    `json:"barrier,omitempty"`
+	Checkpoint *CheckpointView `json:"checkpoint,omitempty"`
+	Manifest   *ManifestView   `json:"manifest,omitempty"`
 }
 
 // FSM is the replicated lease-lock state machine.
@@ -124,13 +196,23 @@ type FSM struct {
 	tokenBounds map[string]uint64
 	// barriers holds named phase barriers, keyed by name.
 	barriers map[string]*Barrier
+	// checkpoints is keyed by task and generation.
+	checkpoints map[string]map[uint64]*Checkpoint
+	// checkpointByRound enforces one checkpoint for each barrier round.
+	checkpointByRound map[string]map[uint64]*Checkpoint
+	latestGeneration  map[string]uint64
+	latestManifest    map[string]*ManifestView
 }
 
 func New() *FSM {
 	return &FSM{
-		leases:      make(map[string]*Lease),
-		tokenBounds: make(map[string]uint64),
-		barriers:    make(map[string]*Barrier),
+		leases:            make(map[string]*Lease),
+		tokenBounds:       make(map[string]uint64),
+		barriers:          make(map[string]*Barrier),
+		checkpoints:       make(map[string]map[uint64]*Checkpoint),
+		checkpointByRound: make(map[string]map[uint64]*Checkpoint),
+		latestGeneration:  make(map[string]uint64),
+		latestManifest:    make(map[string]*ManifestView),
 	}
 }
 
@@ -210,6 +292,16 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 			return Result{OK: false, Err: "barrier not found"}
 		}
 		return Result{OK: true, Barrier: b.view()}
+	case CmdCheckpointCreate:
+		return f.applyCheckpointCreate(cmd)
+	case CmdCheckpointRegister:
+		return f.applyCheckpointRegister(cmd)
+	case CmdCheckpointPublish:
+		return f.applyCheckpointPublish(cmd)
+	case CmdCheckpointQuery:
+		return f.applyCheckpointQuery(cmd)
+	case CmdCheckpointLatest:
+		return f.applyCheckpointLatest(cmd)
 
 	default:
 		return Result{Err: fmt.Sprintf("unknown command type %q", cmd.Type)}
@@ -222,11 +314,23 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 // command, so a waiting barrier's invalidation is decided no later than
 // the next barrier operation.
 func (f *FSM) checkBarrierLiveness(now time.Time) {
-	for _, b := range f.barriers {
+	names := make([]string, 0, len(f.barriers))
+	for name := range f.barriers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		b := f.barriers[name]
 		if b.Status != BarrierWaiting {
 			continue
 		}
-		for _, reg := range b.Arrivals {
+		participants := make([]string, 0, len(b.Arrivals))
+		for participant := range b.Arrivals {
+			participants = append(participants, participant)
+		}
+		sort.Strings(participants)
+		for _, participant := range participants {
+			reg := b.Arrivals[participant]
 			if !f.registrationLeaseValid(reg, now) {
 				b.Status = BarrierFailed
 				b.FailReason = fmt.Sprintf("lease for participant %q on resource %q is no longer valid", reg.Participant, reg.Resource)
@@ -311,6 +415,9 @@ func (f *FSM) applyBarrierArrive(cmd Command) Result {
 	if !member {
 		return Result{OK: false, Err: "unknown participant", Barrier: b.view()}
 	}
+	if cp := f.checkpointByRound[b.Name][b.Round]; cp != nil {
+		return Result{OK: false, Err: "barrier round is bound to a checkpoint; use checkpoint registration", Barrier: b.view(), Checkpoint: cp.view()}
+	}
 	reg := BarrierRegistration{
 		Participant: cmd.Participant,
 		Resource:    cmd.Resource,
@@ -369,6 +476,227 @@ func (f *FSM) applyBarrierAdvance(cmd Command) Result {
 	return Result{OK: true, Barrier: b.view()}
 }
 
+func validCheckpointSHA256(sum string) bool {
+	if len(sum) != 64 {
+		return false
+	}
+	if _, err := hex.DecodeString(sum); err != nil {
+		return false
+	}
+	for _, ch := range sum {
+		if !(ch >= '0' && ch <= '9' || ch >= 'a' && ch <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func checkpointResult(cp *Checkpoint, b *Barrier) Result {
+	view := cp.view()
+	if b != nil {
+		view.BarrierView = b.view()
+	}
+	return Result{OK: true, Barrier: view.BarrierView, Checkpoint: view, Manifest: cp.Published}
+}
+
+func (f *FSM) applyCheckpointCreate(cmd Command) Result {
+	f.checkBarrierLiveness(cmd.Now)
+	if cmd.Task == "" || cmd.Generation == 0 {
+		return Result{OK: false, Err: "task and positive generation are required"}
+	}
+	b := f.barriers[cmd.Barrier]
+	if b == nil {
+		return Result{OK: false, Err: "barrier not found"}
+	}
+	byTask := f.checkpoints[cmd.Task]
+	if byTask != nil {
+		if cp := byTask[cmd.Generation]; cp != nil {
+			if cp.Barrier == cmd.Barrier && cp.Round == b.Round {
+				return checkpointResult(cp, b)
+			}
+			return Result{OK: false, Err: "checkpoint exists with a different barrier binding", Checkpoint: cp.view(), Barrier: b.view()}
+		}
+	}
+	if b.Status != BarrierWaiting {
+		return Result{OK: false, Err: "barrier round is not waiting for bindings", Barrier: b.view()}
+	}
+	roundBindings := f.checkpointByRound[cmd.Barrier]
+	if existing := roundBindings[b.Round]; existing != nil {
+		return Result{OK: false, Err: fmt.Sprintf("barrier round is already bound to task %q generation %d", existing.Task, existing.Generation), Checkpoint: existing.view()}
+	}
+	cp := &Checkpoint{
+		Task:       cmd.Task,
+		Generation: cmd.Generation,
+		Barrier:    cmd.Barrier,
+		Round:      b.Round,
+		Candidates: make(map[string]CheckpointShard),
+	}
+	if f.checkpoints[cmd.Task] == nil {
+		f.checkpoints[cmd.Task] = make(map[uint64]*Checkpoint)
+	}
+	f.checkpoints[cmd.Task][cmd.Generation] = cp
+	if f.checkpointByRound[cmd.Barrier] == nil {
+		f.checkpointByRound[cmd.Barrier] = make(map[uint64]*Checkpoint)
+	}
+	f.checkpointByRound[cmd.Barrier][b.Round] = cp
+	return checkpointResult(cp, b)
+}
+
+func (f *FSM) applyCheckpointRegister(cmd Command) Result {
+	f.checkBarrierLiveness(cmd.Now)
+	if cmd.Task == "" || cmd.Generation == 0 || cmd.Participant == "" ||
+		cmd.Resource == "" || cmd.Holder == "" || cmd.URI == "" {
+		return Result{OK: false, Err: "task, generation, participant, resource, holder and uri are required"}
+	}
+	if !validCheckpointSHA256(cmd.SHA256) {
+		return Result{OK: false, Err: "sha256 must be 64 lowercase hexadecimal characters"}
+	}
+	byTask := f.checkpoints[cmd.Task]
+	if byTask == nil || byTask[cmd.Generation] == nil {
+		return Result{OK: false, Err: "checkpoint not found"}
+	}
+	cp := byTask[cmd.Generation]
+	if cp.Published != nil {
+		return Result{OK: false, Err: "checkpoint is already published", Checkpoint: cp.view(), Manifest: cp.Published}
+	}
+	b := f.barriers[cp.Barrier]
+	if b == nil {
+		return Result{OK: false, Err: "bound barrier no longer exists", Checkpoint: cp.view()}
+	}
+	if b.Round != cp.Round {
+		return Result{OK: false, Err: "bound barrier round has advanced", Barrier: b.view(), Checkpoint: cp.view()}
+	}
+	if b.Status != BarrierWaiting && b.Status != BarrierCompleted {
+		return Result{OK: false, Err: "bound barrier round is " + b.Status, Barrier: b.view(), Checkpoint: cp.view()}
+	}
+	member := false
+	for _, p := range b.Participants {
+		if p == cmd.Participant {
+			member = true
+			break
+		}
+	}
+	if !member {
+		return Result{OK: false, Err: "unknown participant", Barrier: b.view(), Checkpoint: cp.view()}
+	}
+	shard := CheckpointShard{
+		Participant: cmd.Participant,
+		Resource:    cmd.Resource,
+		Holder:      cmd.Holder,
+		Token:       cmd.Token,
+		URI:         cmd.URI,
+		SHA256:      cmd.SHA256,
+		Size:        cmd.Size,
+	}
+	if prev, exists := cp.Candidates[cmd.Participant]; exists {
+		if prev == shard {
+			return checkpointResult(cp, b)
+		}
+		return Result{OK: false, Err: "conflicting shard metadata for participant", Barrier: b.view(), Checkpoint: cp.view()}
+	}
+	reg := BarrierRegistration{Participant: cmd.Participant, Resource: cmd.Resource, Holder: cmd.Holder, Token: cmd.Token}
+	if arrived, exists := b.Arrivals[cmd.Participant]; exists {
+		if arrived != reg {
+			return Result{OK: false, Err: "conflicting barrier registration for participant", Barrier: b.view(), Checkpoint: cp.view()}
+		}
+	} else {
+		for _, other := range b.Arrivals {
+			if other.Resource == cmd.Resource {
+				return Result{OK: false, Err: "resource already registered by another participant this round", Barrier: b.view(), Checkpoint: cp.view()}
+			}
+		}
+		if !f.registrationLeaseValid(reg, cmd.Now) {
+			return Result{OK: false, Err: "no matching valid lease for resource/holder/token", Barrier: b.view(), Checkpoint: cp.view()}
+		}
+		b.Arrivals[cmd.Participant] = reg
+	}
+	cp.Candidates[cmd.Participant] = shard
+	if len(b.Arrivals) == len(b.Participants) {
+		for _, p := range b.Participants {
+			r := b.Arrivals[p]
+			if !f.registrationLeaseValid(r, cmd.Now) {
+				b.Status = BarrierFailed
+				b.FailReason = fmt.Sprintf("lease for participant %q on resource %q invalid at completion", r.Participant, r.Resource)
+				return Result{OK: false, Err: b.FailReason, Barrier: b.view(), Checkpoint: cp.view()}
+			}
+		}
+		b.Status = BarrierCompleted
+	}
+	return checkpointResult(cp, b)
+}
+
+func (f *FSM) manifestFromCheckpoint(cp *Checkpoint) (*ManifestView, bool) {
+	b := f.barriers[cp.Barrier]
+	if b == nil || len(cp.Candidates) != len(b.Participants) {
+		return nil, false
+	}
+	shards := make([]ShardView, 0, len(cp.Candidates))
+	for _, shard := range cp.Candidates {
+		shards = append(shards, ShardView{Participant: shard.Participant, URI: shard.URI, SHA256: shard.SHA256, Size: shard.Size})
+	}
+	sort.Slice(shards, func(i, j int) bool { return shards[i].Participant < shards[j].Participant })
+	return &ManifestView{Task: cp.Task, Generation: cp.Generation, Barrier: cp.Barrier, Round: cp.Round, Shards: shards}, true
+}
+
+func (f *FSM) applyCheckpointPublish(cmd Command) Result {
+	byTask := f.checkpoints[cmd.Task]
+	if byTask == nil || byTask[cmd.Generation] == nil {
+		return Result{OK: false, Err: "checkpoint not found"}
+	}
+	cp := byTask[cmd.Generation]
+	if cp.Published != nil {
+		return Result{OK: true, Checkpoint: cp.view(), Manifest: cp.Published}
+	}
+	if latest := f.latestGeneration[cmd.Task]; cmd.Generation <= latest {
+		return Result{OK: false, Err: fmt.Sprintf("generation %d is not greater than latest published generation %d", cmd.Generation, latest), Manifest: f.latestManifest[cmd.Task]}
+	}
+	b := f.barriers[cp.Barrier]
+	if b == nil {
+		return Result{OK: false, Err: "bound barrier no longer exists", Checkpoint: cp.view()}
+	}
+	if b.Round != cp.Round {
+		return Result{OK: false, Err: "bound barrier round has advanced", Barrier: b.view(), Checkpoint: cp.view()}
+	}
+	if b.Status != BarrierCompleted {
+		return Result{OK: false, Err: "bound barrier round is not complete", Barrier: b.view(), Checkpoint: cp.view()}
+	}
+	if len(cp.Candidates) != len(b.Participants) {
+		return Result{OK: false, Err: "not every participant has shard metadata", Barrier: b.view(), Checkpoint: cp.view()}
+	}
+	for _, p := range b.Participants {
+		arrival, arrived := b.Arrivals[p]
+		shard, hasShard := cp.Candidates[p]
+		if !arrived || !hasShard || arrival.Resource != shard.Resource || arrival.Holder != shard.Holder || arrival.Token != shard.Token {
+			return Result{OK: false, Err: "shard metadata does not cover every barrier arrival", Barrier: b.view(), Checkpoint: cp.view()}
+		}
+	}
+	manifest, ok := f.manifestFromCheckpoint(cp)
+	if !ok {
+		return Result{OK: false, Err: "not every participant has shard metadata"}
+	}
+	cp.Published = manifest
+	f.latestGeneration[cmd.Task] = cp.Generation
+	f.latestManifest[cmd.Task] = manifest
+	return Result{OK: true, Checkpoint: cp.view(), Manifest: manifest}
+}
+
+func (f *FSM) applyCheckpointQuery(cmd Command) Result {
+	byTask := f.checkpoints[cmd.Task]
+	if byTask == nil || byTask[cmd.Generation] == nil {
+		return Result{OK: false, Err: "checkpoint not found"}
+	}
+	cp := byTask[cmd.Generation]
+	return Result{OK: true, Checkpoint: cp.view(), Manifest: cp.Published}
+}
+
+func (f *FSM) applyCheckpointLatest(cmd Command) Result {
+	manifest := f.latestManifest[cmd.Task]
+	if manifest == nil {
+		return Result{OK: false, Err: "no published checkpoint for task"}
+	}
+	return Result{OK: true, Manifest: manifest}
+}
+
 // Query returns the live lease for a resource as of now, or nil.
 func (f *FSM) Query(resource string, now time.Time) *Lease {
 	f.mu.RLock()
@@ -392,7 +720,10 @@ type snapshot struct {
 	Leases      map[string]*Lease `json:"leases"`
 	TokenBounds map[string]uint64 `json:"token_bounds"`
 	// Barriers is absent in older snapshots; Restore treats it as empty.
-	Barriers map[string]*Barrier `json:"barriers,omitempty"`
+	Barriers         map[string]*Barrier               `json:"barriers,omitempty"`
+	Checkpoints      map[string]map[uint64]*Checkpoint `json:"checkpoints,omitempty"`
+	LatestGeneration map[string]uint64                 `json:"latest_generation,omitempty"`
+	LatestManifest   map[string]*ManifestView          `json:"latest_manifest,omitempty"`
 }
 
 // Snapshot captures leases, token upper bounds and barrier state.
@@ -400,9 +731,12 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	s := snapshot{
-		Leases:      make(map[string]*Lease, len(f.leases)),
-		TokenBounds: make(map[string]uint64, len(f.tokenBounds)),
-		Barriers:    make(map[string]*Barrier, len(f.barriers)),
+		Leases:           make(map[string]*Lease, len(f.leases)),
+		TokenBounds:      make(map[string]uint64, len(f.tokenBounds)),
+		Barriers:         make(map[string]*Barrier, len(f.barriers)),
+		Checkpoints:      make(map[string]map[uint64]*Checkpoint, len(f.checkpoints)),
+		LatestGeneration: make(map[string]uint64, len(f.latestGeneration)),
+		LatestManifest:   make(map[string]*ManifestView, len(f.latestManifest)),
 	}
 	for k, v := range f.leases {
 		cp := *v
@@ -419,6 +753,31 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 			cp.Arrivals[p] = reg
 		}
 		s.Barriers[k] = &cp
+	}
+	for task, generations := range f.checkpoints {
+		copied := make(map[uint64]*Checkpoint, len(generations))
+		for generation, checkpoint := range generations {
+			cp := *checkpoint
+			cp.Candidates = make(map[string]CheckpointShard, len(checkpoint.Candidates))
+			for participant, shard := range checkpoint.Candidates {
+				cp.Candidates[participant] = shard
+			}
+			if checkpoint.Published != nil {
+				manifest := *checkpoint.Published
+				manifest.Shards = append([]ShardView(nil), checkpoint.Published.Shards...)
+				cp.Published = &manifest
+			}
+			copied[generation] = &cp
+		}
+		s.Checkpoints[task] = copied
+	}
+	for task, generation := range f.latestGeneration {
+		s.LatestGeneration[task] = generation
+	}
+	for task, manifest := range f.latestManifest {
+		cp := *manifest
+		cp.Shards = append([]ShardView(nil), manifest.Shards...)
+		s.LatestManifest[task] = &cp
 	}
 	return &fsmSnapshot{state: s}, nil
 }
@@ -448,6 +807,37 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	for _, b := range f.barriers {
 		if b.Arrivals == nil {
 			b.Arrivals = make(map[string]BarrierRegistration)
+		}
+	}
+	f.checkpoints = s.Checkpoints
+	if f.checkpoints == nil {
+		f.checkpoints = make(map[string]map[uint64]*Checkpoint)
+	}
+	f.latestGeneration = s.LatestGeneration
+	if f.latestGeneration == nil {
+		f.latestGeneration = make(map[string]uint64)
+	}
+	f.latestManifest = s.LatestManifest
+	if f.latestManifest == nil {
+		f.latestManifest = make(map[string]*ManifestView)
+	}
+	f.checkpointByRound = make(map[string]map[uint64]*Checkpoint)
+	for task, generations := range f.checkpoints {
+		for generation, cp := range generations {
+			if cp == nil {
+				delete(generations, generation)
+				continue
+			}
+			if cp.Candidates == nil {
+				cp.Candidates = make(map[string]CheckpointShard)
+			}
+			if f.checkpointByRound[cp.Barrier] == nil {
+				f.checkpointByRound[cp.Barrier] = make(map[uint64]*Checkpoint)
+			}
+			f.checkpointByRound[cp.Barrier][cp.Round] = cp
+		}
+		if len(generations) == 0 {
+			delete(f.checkpoints, task)
 		}
 	}
 	return nil

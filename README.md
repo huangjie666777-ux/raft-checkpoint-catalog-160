@@ -8,9 +8,10 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `internal/fsm/fsm.go` | 租约与屏障状态机：申请/续租/释放判定、防护令牌上界、阶段屏障、快照与恢复 |
+| internal/fsm/fsm.go | 租约、屏障与检查点目录状态机：命令判定、防护令牌、快照与恢复 |
+| internal/fsm/checkpoint_test.go | 分布式检查点目录自测：绑定、原子登记、发布、代单调、快照恢复 |
 | `internal/node/node.go` | Raft 节点：TCP 传输、BoltDB 日志/任期/投票持久化、首次引导 |
-| `internal/api/http.go` | HTTP API：leader 校验、请求校验、租约与屏障端点、提交超时处理 |
+| internal/api/http.go | HTTP API：leader 校验、请求校验、租约、屏障与检查点端点、提交超时处理 |
 | `cmd/lockd/main.go` | 进程入口：解析配置、启动节点、信号退出时关闭网络与存储 |
 | `internal/fsm/fsm_test.go` | 租约状态机自测（争用、令牌单调、过期、快照恢复） |
 | `internal/fsm/barrier_test.go` | 屏障自测（幂等创建、会合、租约失效判负、推进、快照恢复、旧快照兼容） |
@@ -82,6 +83,20 @@ PEERS="n1=127.0.0.1:7101=127.0.0.1:8101,n2=127.0.0.1:7102=127.0.0.1:8102,n3=127.
 快照同时保存屏障配置、轮号、状态与到达登记，随租约一同恢复；不含屏障字段的旧
 快照照常兼容。重启与换主不丢状态，也不接纳旧轮请求。
 
+## 分布式检查点目录
+
+检查点按任务名和正整数代号标识，创建时绑定一个已有屏障的当前等待轮。一个屏障轮至多绑定一个检查点；相同任务、代号和绑定重发幂等，改变绑定返回冲突。只有成功发布才推进任务最新代，后续发布代号必须高于最新已发布代号。
+
+- POST /checkpoints：请求 task、generation、barrier；返回绑定轮和发布状态。GET /checkpoints?task=job&generation=1 查询指定检查点。
+- POST /checkpoints/register：请求 checkpoint 身份、participant、resource、holder、token、uri、sha256、size。sha256 为 64 位小写十六进制，size 为非负字节数；服务只保存元数据，不访问分片。
+- 登记命令在同一个 Raft 提交中写入屏障到达和候选分片；任一侧失败则两者都不落状态。相同请求幂等，任一字段改变返回冲突。
+- 已绑定检查点的屏障轮拒绝旧 POST /barrier/arrive，不能绕过分片齐全判定。
+- POST /checkpoints/publish：绑定轮仍存在且 completed，每个成员都有相互匹配的到达和分片元数据才发布。
+- 未到齐、失败或已推进的未发布轮拒绝；发布清单不可变，并原子更新任务最新代。相同发布重试返回原清单；之后推进或租约失效不改变结果，失败候选不覆盖旧清单。
+- GET /checkpoints/latest?task=job：返回任务最新已发布清单，shards 按参与者 ID 排序，供重启后的计算任务读取完整分片。
+
+快照保存屏障轮绑定、候选分片、已发布清单与任务最新代；不含这些字段的旧快照仍可恢复。多租约同时失效时按屏障名和参与者 ID 排序判定，副本生成一致的失败原因。
+
 ## 一致性设计
 
 - 判定时刻由 leader 写入日志命令（`Command.Now`），副本重放不读取本地时钟；
@@ -128,3 +143,18 @@ curl -X POST 127.0.0.1:8101/release -d '{"resource":"res-w1","holder":"w1","toke
 curl "127.0.0.1:8101/barrier?name=phase"   # status=failed，含 fail_reason
 curl -X POST 127.0.0.1:8101/barrier/advance -d '{"name":"phase","round":2}'  # 失败后仍可推进
 ```
+
+### 检查点登记、发布与恢复查询
+
+先创建参与者为 w1/w2 的屏障 job-phase，取得两人的独立租约，然后：
+
+1. 创建并绑定检查点：
+   curl -X POST 127.0.0.1:8101/checkpoints -d '{"task":"job","generation":1,"barrier":"job-phase"}'
+2. w1 登记：
+   curl -X POST 127.0.0.1:8101/checkpoints/register -d '{"task":"job","generation":1,"participant":"w1","resource":"job-w1","holder":"w1","token":1,"uri":"s3://bucket/job/1/w1","sha256":"1111111111111111111111111111111111111111111111111111111111111111","size":4096}'
+3. w2 登记；第二条到齐后屏障 completed：
+   curl -X POST 127.0.0.1:8101/checkpoints/register -d '{"task":"job","generation":1,"participant":"w2","resource":"job-w2","holder":"w2","token":1,"uri":"s3://bucket/job/1/w2","sha256":"2222222222222222222222222222222222222222222222222222222222222222","size":8192}'
+4. 发布并查询恢复所需清单：
+   curl -X POST 127.0.0.1:8101/checkpoints/publish -d '{"task":"job","generation":1}'
+   curl "127.0.0.1:8101/checkpoints?task=job&generation=1"
+   curl "127.0.0.1:8101/checkpoints/latest?task=job"
